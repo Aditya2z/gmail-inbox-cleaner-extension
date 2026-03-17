@@ -16,17 +16,19 @@ function initMarkRead() {
   "use strict";
 
   const DELAY = {
-    STEP:  1000,   // between actions
-    // Navigation can be slow (network / Gmail experiments / virtualization).
-    // Treat this as a *deadline* for detecting a page change.
-    NAV:   8000,   // ms after clicking Older — wait for page to change
-    POLL:   300,   // poll interval
-    MAX_POLLS: 20, // 20 × 300ms = 6 s max per wait
+    // Keep a consistent buffer between steps (requested).
+    BUFFER: 500,
+    // Polling cadence for "wait until condition is true".
+    POLL: 250,
+    // Upper bound so we never wait forever (not used as "execution timer").
+    MAX_POLLS: 60, // 60 × 250ms = 15s max wait per condition
   };
 
   // ── Helpers ─────────────────────────────────────────────────
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  const buffer = () => sleep(DELAY.BUFFER);
 
   function log(...a) { console.log("[GmailMarkRead]", ...a); }
 
@@ -49,18 +51,83 @@ function initMarkRead() {
     el.click();
   }
 
+  function getThreadListRoot() {
+    // Observe a tight subtree if possible (table/tbody that contains tr.zA),
+    // otherwise fall back to the main container.
+    const row = document.querySelector("tr.zA");
+    return row?.closest("tbody") || row?.closest("table") || document.querySelector('div[role="main"]') || document.body;
+  }
+
+  function getRangeNode() {
+    // Prefer the canonical toolbar range element (span.Dj).
+    return (
+      document.querySelector('div[role="button"][aria-label*="Show more messages"] span.Dj') ||
+      document.querySelector("div.amH span.Dj") ||
+      document.querySelector("span.Dj") ||
+      null
+    );
+  }
+
+  async function waitUntil(predicate, { timeoutMs, observe = [] } = {}) {
+    // Event-driven wait: resolve when predicate becomes true, triggered by DOM mutations.
+    // Includes a timeout so we never hang forever.
+    const deadline = Date.now() + (timeoutMs ?? 15000);
+
+    if (predicate()) return true;
+
+    const nodes = observe.filter(Boolean);
+    if (nodes.length === 0) nodes.push(document.body);
+
+    return await new Promise((resolve) => {
+      let done = false;
+
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        try { obs.disconnect(); } catch { /* ignore */ }
+        try { clearTimeout(timer); } catch { /* ignore */ }
+        resolve(ok);
+      };
+
+      const onTick = () => {
+        if (done) return;
+        if (predicate()) return finish(true);
+        if (Date.now() > deadline) return finish(false);
+      };
+
+      const obs = new MutationObserver(() => onTick());
+      for (const n of nodes) {
+        try {
+          obs.observe(n, { subtree: true, childList: true, characterData: true, attributes: true });
+        } catch {
+          // Some nodes may be invalid to observe; ignore.
+        }
+      }
+
+      const timer = setTimeout(() => finish(predicate()), Math.max(0, deadline - Date.now()));
+
+      // In case the relevant node changes without a mutation on our observed roots,
+      // do a lightweight periodic check as a backstop.
+      (async () => {
+        while (!done) {
+          await sleep(DELAY.POLL);
+          onTick();
+        }
+      })();
+    });
+  }
+
   function anyRowSelected() {
     // Gmail selection state varies by experiment; keep this broad.
     return !!document.querySelector('tr.zA[aria-checked="true"], tr.zA.x7, tr.zA.PE');
   }
 
   async function waitForSelection() {
-    // Wait until selecting takes effect before looking for toolbar actions.
-    for (let i = 0; i < DELAY.MAX_POLLS; i++) {
-      if (anyRowSelected()) return true;
-      await sleep(DELAY.POLL);
-    }
-    return false;
+    // Prefer event-driven waiting; fall back to polling inside waitUntil backstop.
+    return await waitUntil(anyRowSelected, {
+      timeoutMs: DELAY.MAX_POLLS * DELAY.POLL,
+      observe: [getThreadListRoot()],
+    });
   }
 
   /** Poll fn() until truthy, up to MAX_POLLS times. */
@@ -90,13 +157,13 @@ function initMarkRead() {
     log("Found Select-All div:", cb.className);
     // Click and then wait for any selection to appear. Retry once if needed.
     safeClick(cb);
-    await sleep(DELAY.STEP);
+    await buffer();
 
     let selected = await waitForSelection();
     if (!selected) {
       log("No selection detected after Select-All click — retrying once.");
       safeClick(cb);
-      await sleep(DELAY.STEP);
+      await buffer();
       selected = await waitForSelection();
     }
 
@@ -139,7 +206,7 @@ function initMarkRead() {
 
     log("Found Mark-as-Read button:", btn.getAttribute("data-tooltip") || btn.className);
     safeClick(btn);
-    await sleep(DELAY.STEP);
+    await buffer();
     return true;
   }
 
@@ -149,6 +216,11 @@ function initMarkRead() {
     // Gmail typically shows a range like "1–50 of 2,345" in the toolbar.
     // This changes reliably on paging even when rows are virtualized/reused.
     const candidates = [
+      // Most specific: the "Show more messages" range button contains span.Dj
+      'div[role="button"][aria-label*="Show more messages"] span.Dj',
+      // Common toolbar container class (can vary, but tends to include the range)
+      "div.amH span.Dj",
+      // Broad fallback
       "span.Dj",
       'div[role="main"] span[aria-label*="of"]',
       'div[role="main"] *[aria-label*="of"]',
@@ -178,16 +250,38 @@ function initMarkRead() {
     return `${getRangeText()}|n=${rows.length}|f=${firstRowKey}|l=${lastRowKey}`;
   }
 
-  async function waitForPageChange(beforeSnap) {
-    const deadline = Date.now() + DELAY.NAV;
-    while (Date.now() < deadline) {
-      await sleep(DELAY.POLL);
+  async function waitForRangeChange(beforeRange) {
+    // Primary "page changed" detector: range text changes (e.g., "1–50 of …" → "51–100 of …").
+    // This is synchronous in the sense that we only proceed once the condition is met.
+    const pred = () => {
+      const now = getRangeText();
+      return !!(now && now !== beforeRange);
+    };
+
+    const ok = await waitUntil(pred, {
+      timeoutMs: DELAY.MAX_POLLS * DELAY.POLL,
+      observe: [getRangeNode(), getThreadListRoot()],
+    });
+
+    // If the range node was replaced during navigation, re-check once.
+    if (ok) return true;
+    return pred();
+  }
+
+  async function waitForPageReady(beforeRange) {
+    // Wait for rows and (ideally) range text change.
+    await poll(() => document.querySelector("tr.zA"));
+    if (!beforeRange) return true;
+    const changed = await waitForRangeChange(beforeRange);
+    if (changed) return true;
+    // Fallback: if range text is missing or unchanged, use snapshot change.
+    const beforeSnap = rowSnapshot();
+    for (let i = 0; i < Math.max(10, Math.floor(DELAY.MAX_POLLS / 3)); i++) {
       const now = rowSnapshot();
       if (now && now !== beforeSnap) return true;
+      await sleep(DELAY.POLL);
     }
-    // One last grace period: Gmail sometimes updates just after our deadline.
-    await sleep(1200);
-    return rowSnapshot() !== beforeSnap;
+    return false;
   }
 
   async function goOlder() {
@@ -221,40 +315,18 @@ function initMarkRead() {
 
     if (disabled) { log("Older button disabled."); return false; }
 
-    const before = rowSnapshot();
+    const beforeRange = getRangeText();
     safeClick(btn);
-    log("Clicked Older — waiting for rows to change…");
+    log("Clicked Older — waiting for range/page to change…");
+    await buffer();
 
-    const changed = await waitForPageChange(before);
-    if (changed) {
-      log("Page changed ✓");
-      await sleep(500);
-      return true;
-    }
-
-    // If we couldn't *detect* a change, don't immediately assume "last page".
-    // Gmail can be slow; try one conservative re-check before giving up.
-    log("Page change not detected within deadline.");
+    const ready = await waitForPageReady(beforeRange);
+    if (ready) { log("Page changed ✓"); await buffer(); return true; }
+    log("Page change not detected (range/snapshot).");
     return false;
   }
 
   // ── MAIN LOOP ────────────────────────────────────────────────
-
-  async function waitForInboxReady(prevSnap = "") {
-    // Ensure we're not acting mid-navigation. We consider the inbox "ready" when:
-    // - at least one thread row exists
-    // - and (if provided) the rowSnapshot differs from the previous page snapshot
-    await poll(() => document.querySelector("tr.zA"));
-
-    if (!prevSnap) return true;
-
-    const deadline = Date.now() + DELAY.NAV;
-    while (Date.now() < deadline) {
-      if (rowSnapshot() !== prevSnap) return true;
-      await sleep(DELAY.POLL);
-    }
-    return rowSnapshot() !== prevSnap;
-  }
 
   async function run() {
     log("═══ Starting ═══");
@@ -265,7 +337,7 @@ function initMarkRead() {
     let totalMarked = 0;
     let missStreak = 0;       // consecutive pages where Mark-as-Read btn was absent
     const MAX_MISSES = 3;     // stop after 3 pages in a row with no button
-    let lastPageSnap = "";    // used to ensure we only act after paging completes
+    let lastRange = "";       // used to ensure we only act after paging completes
 
     while (true) {
 
@@ -276,21 +348,14 @@ function initMarkRead() {
       }
 
       log(`\n── Page ${page} ──`);
-      post("PROGRESS", `Page ${page}: waiting for page to be ready…`);
+      post("PROGRESS", `Page ${page}: waiting for page change…`);
 
-      // Enforce strict sequence: don't start selecting until page change has completed.
-      const ready = await waitForInboxReady(lastPageSnap);
-      if (!ready) {
-        post("WARN", `Page ${page}: page did not fully load in time — retrying…`);
-        await sleep(600);
-        await waitForInboxReady(lastPageSnap);
-      }
+      // Synchronous gating: do not act until page is ready (range changed vs previous).
+      await waitForPageReady(lastRange);
+      lastRange = getRangeText() || lastRange;
+      await buffer();
 
-      // Refresh the snapshot we consider "this page"
-      lastPageSnap = rowSnapshot();
-      await sleep(250);
-
-      post("PROGRESS", `Page ${page}: selecting emails…`);
+      post("PROGRESS", `Page ${page}: selecting all…`);
 
       // ── Step 1: Select All ──────────────────────────────────
       const selected = await selectAll();
@@ -304,6 +369,7 @@ function initMarkRead() {
 
       // ── Step 2: Mark as Read ────────────────────────────────
       post("PROGRESS", `Page ${page}: looking for Mark as Read button…`);
+      await buffer();
       const marked = await markAsRead();
 
       if (stopped()) { post("STOPPED", "Stopped by user."); return; }
@@ -325,6 +391,7 @@ function initMarkRead() {
           post("DONE", `Last page reached. ${totalMarked} email(s) marked.`);
           return;
         }
+        lastRange = getRangeText() || lastRange;
         page++;
         continue;
       }
@@ -338,6 +405,7 @@ function initMarkRead() {
       if (stopped()) { post("STOPPED", "Stopped by user."); return; }
 
       post("PROGRESS", `Moving to page ${page + 1}…`);
+      await buffer();
       const advanced = await goOlder();
 
       if (!advanced) {
@@ -345,6 +413,7 @@ function initMarkRead() {
         return;
       }
 
+      lastRange = getRangeText() || lastRange;
       page++;
     }
   }
