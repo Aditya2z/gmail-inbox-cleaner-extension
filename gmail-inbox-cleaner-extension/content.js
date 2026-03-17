@@ -240,6 +240,22 @@ function initMarkRead() {
 
   // ── MAIN LOOP ────────────────────────────────────────────────
 
+  async function waitForInboxReady(prevSnap = "") {
+    // Ensure we're not acting mid-navigation. We consider the inbox "ready" when:
+    // - at least one thread row exists
+    // - and (if provided) the rowSnapshot differs from the previous page snapshot
+    await poll(() => document.querySelector("tr.zA"));
+
+    if (!prevSnap) return true;
+
+    const deadline = Date.now() + DELAY.NAV;
+    while (Date.now() < deadline) {
+      if (rowSnapshot() !== prevSnap) return true;
+      await sleep(DELAY.POLL);
+    }
+    return rowSnapshot() !== prevSnap;
+  }
+
   async function run() {
     log("═══ Starting ═══");
     post("PROGRESS", "Starting…");
@@ -249,6 +265,7 @@ function initMarkRead() {
     let totalMarked = 0;
     let missStreak = 0;       // consecutive pages where Mark-as-Read btn was absent
     const MAX_MISSES = 3;     // stop after 3 pages in a row with no button
+    let lastPageSnap = "";    // used to ensure we only act after paging completes
 
     while (true) {
 
@@ -259,11 +276,21 @@ function initMarkRead() {
       }
 
       log(`\n── Page ${page} ──`);
-      post("PROGRESS", `Page ${page}: selecting emails…`);
+      post("PROGRESS", `Page ${page}: waiting for page to be ready…`);
 
-      // Wait for email rows to appear
-      await poll(() => document.querySelector("tr.zA"));
-      await sleep(400);
+      // Enforce strict sequence: don't start selecting until page change has completed.
+      const ready = await waitForInboxReady(lastPageSnap);
+      if (!ready) {
+        post("WARN", `Page ${page}: page did not fully load in time — retrying…`);
+        await sleep(600);
+        await waitForInboxReady(lastPageSnap);
+      }
+
+      // Refresh the snapshot we consider "this page"
+      lastPageSnap = rowSnapshot();
+      await sleep(250);
+
+      post("PROGRESS", `Page ${page}: selecting emails…`);
 
       // ── Step 1: Select All ──────────────────────────────────
       const selected = await selectAll();
