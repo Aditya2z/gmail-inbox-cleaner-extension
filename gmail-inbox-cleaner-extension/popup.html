@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Gmail Mark All As Read</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0f1117;
+      --surface: #1a1d27;
+      --border:  #2a2d3a;
+      --accent:  #4f8ef7;
+      --stop:    #f87171;
+      --success: #34d399;
+      --warning: #fbbf24;
+      --text:    #e8eaf0;
+      --muted:   #6b7280;
+    }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      width: 300px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    /* Header */
+    .header { display: flex; align-items: center; gap: 10px; }
+    .header-icon {
+      width: 34px; height: 34px;
+      background: linear-gradient(135deg, #4f8ef7, #7c3aed);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 17px; flex-shrink: 0;
+    }
+    .header-text h1 { font-size: 13px; font-weight: 700; }
+    .header-text p  { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    /* Status bar */
+    .status-bar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex; align-items: center; gap: 10px;
+      min-height: 42px;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--muted); flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .dot.ready   { background: var(--success); box-shadow: 0 0 6px var(--success); }
+    .dot.running { background: var(--accent);  box-shadow: 0 0 6px var(--accent);
+                   animation: pulse 1.2s ease-in-out infinite; }
+    .dot.done    { background: var(--success); box-shadow: 0 0 6px var(--success); }
+    .dot.error   { background: var(--stop);    box-shadow: 0 0 6px var(--stop); }
+    .dot.warn    { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+    .dot.stopped { background: var(--warning); }
+
+    @keyframes pulse {
+      0%,100% { opacity:1; transform:scale(1); }
+      50%     { opacity:.5; transform:scale(.8); }
+    }
+
+    #statusText { font-size: 12px; color: var(--muted); line-height: 1.4; flex:1; }
+
+    /* Progress */
+    .progress { display:none; flex-direction:column; gap:4px; }
+    .progress.on { display:flex; }
+    .track { height:3px; background:var(--border); border-radius:2px; overflow:hidden; }
+    .fill  {
+      height:100%; border-radius:2px;
+      background: linear-gradient(90deg, var(--accent), #7c3aed);
+      background-size: 200% 100%;
+      animation: shimmer 1.8s linear infinite;
+      width: 100%;
+    }
+    @keyframes shimmer {
+      0%   { background-position: 200% center; }
+      100% { background-position:-200% center; }
+    }
+    .prog-label { font-size:11px; color:var(--muted); text-align:right; }
+
+    /* Buttons */
+    .btn-row { display:flex; gap:8px; }
+
+    button {
+      flex:1; padding:10px 14px;
+      border:none; border-radius:8px;
+      font-size:13px; font-weight:600;
+      cursor:pointer;
+      display:flex; align-items:center; justify-content:center; gap:6px;
+      transition: opacity .2s, transform .15s, box-shadow .2s;
+    }
+    button:hover:not(:disabled) { opacity:.9; transform:translateY(-1px); }
+    button:active:not(:disabled){ transform:translateY(0); }
+    button:disabled { opacity:.35; cursor:not-allowed; }
+
+    #btnStart {
+      background: linear-gradient(135deg, #4f8ef7, #5b6cf8);
+      color:#fff;
+      box-shadow: 0 2px 12px rgba(79,142,247,.4);
+    }
+    #btnStop {
+      background: rgba(248,113,113,.15);
+      color: var(--stop);
+      border: 1px solid rgba(248,113,113,.35);
+    }
+    #btnStop:hover:not(:disabled) {
+      background: rgba(248,113,113,.25);
+      box-shadow: 0 2px 10px rgba(248,113,113,.3);
+    }
+
+    .note { font-size:10.5px; color:var(--muted); text-align:center; line-height:1.5; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="header-icon">✉️</div>
+    <div class="header-text">
+      <h1>Mark All As Read</h1>
+      <p>Gmail Inbox Cleaner</p>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <div class="dot" id="dot"></div>
+    <span id="statusText">Open Gmail and click Start.</span>
+  </div>
+
+  <div class="progress" id="progress">
+    <div class="track"><div class="fill"></div></div>
+    <div class="prog-label" id="progLabel">Processing…</div>
+  </div>
+
+  <div class="btn-row">
+    <button id="btnStart"><span>▶</span> Start</button>
+    <button id="btnStop" disabled><span>⏹</span> Stop</button>
+  </div>
+
+  <p class="note">Keep Gmail open while running.</p>
+
+  <script src="popup.js"></script>
+</body>
+</html>
