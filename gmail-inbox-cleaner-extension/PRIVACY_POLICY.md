@@ -1,4 +1,4 @@
-Privacy Policy for Gmail Mark All As Read Extension
+Privacy Policy for Gmail Inbox Cleaner Extension
 
 This Chrome extension does not collect, store, transmit, or share any personal or sensitive user data.
 
