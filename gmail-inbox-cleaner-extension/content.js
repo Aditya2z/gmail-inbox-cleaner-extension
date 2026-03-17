@@ -17,11 +17,11 @@ function initMarkRead() {
 
   const DELAY = {
     // Keep a consistent buffer between steps (requested).
-    BUFFER: 500,
+    BUFFER: 100,
     // Polling cadence for "wait until condition is true".
     POLL: 250,
     // Upper bound so we never wait forever (not used as "execution timer").
-    MAX_POLLS: 60, // 60 × 250ms = 15s max wait per condition
+    MAX_POLLS: 16, // 16 × 250ms = 4s max wait per condition
   };
 
   // ── Helpers ─────────────────────────────────────────────────
@@ -51,83 +51,30 @@ function initMarkRead() {
     el.click();
   }
 
-  function getThreadListRoot() {
-    // Observe a tight subtree if possible (table/tbody that contains tr.zA),
-    // otherwise fall back to the main container.
-    const row = document.querySelector("tr.zA");
-    return row?.closest("tbody") || row?.closest("table") || document.querySelector('div[role="main"]') || document.body;
-  }
-
-  function getRangeNode() {
-    // Prefer the canonical toolbar range element (span.Dj).
-    return (
-      document.querySelector('div[role="button"][aria-label*="Show more messages"] span.Dj') ||
-      document.querySelector("div.amH span.Dj") ||
-      document.querySelector("span.Dj") ||
-      null
-    );
-  }
-
-  async function waitUntil(predicate, { timeoutMs, observe = [] } = {}) {
-    // Event-driven wait: resolve when predicate becomes true, triggered by DOM mutations.
-    // Includes a timeout so we never hang forever.
-    const deadline = Date.now() + (timeoutMs ?? 15000);
-
-    if (predicate()) return true;
-
-    const nodes = observe.filter(Boolean);
-    if (nodes.length === 0) nodes.push(document.body);
-
-    return await new Promise((resolve) => {
-      let done = false;
-
-      const finish = (ok) => {
-        if (done) return;
-        done = true;
-        try { obs.disconnect(); } catch { /* ignore */ }
-        try { clearTimeout(timer); } catch { /* ignore */ }
-        resolve(ok);
-      };
-
-      const onTick = () => {
-        if (done) return;
-        if (predicate()) return finish(true);
-        if (Date.now() > deadline) return finish(false);
-      };
-
-      const obs = new MutationObserver(() => onTick());
-      for (const n of nodes) {
-        try {
-          obs.observe(n, { subtree: true, childList: true, characterData: true, attributes: true });
-        } catch {
-          // Some nodes may be invalid to observe; ignore.
-        }
-      }
-
-      const timer = setTimeout(() => finish(predicate()), Math.max(0, deadline - Date.now()));
-
-      // In case the relevant node changes without a mutation on our observed roots,
-      // do a lightweight periodic check as a backstop.
-      (async () => {
-        while (!done) {
-          await sleep(DELAY.POLL);
-          onTick();
-        }
-      })();
-    });
-  }
-
   function anyRowSelected() {
     // Gmail selection state varies by experiment; keep this broad.
     return !!document.querySelector('tr.zA[aria-checked="true"], tr.zA.x7, tr.zA.PE');
   }
 
+  function findMarkAsReadButtonVisible() {
+    // Returns the visible Mark-as-Read button if present, else null.
+    const byTooltip = document.querySelector('[data-tooltip="Mark as read"]');
+    if (byTooltip && byTooltip.offsetParent !== null) return byTooltip;
+
+    const byLabel = document.querySelector('[aria-label="Mark as read"]');
+    if (byLabel && byLabel.offsetParent !== null) return byLabel;
+
+    const candidates = [...document.querySelectorAll('div[role="button"][act="1"]')];
+    return candidates.find((e) => e.offsetParent !== null) || null;
+  }
+
   async function waitForSelection() {
-    // Prefer event-driven waiting; fall back to polling inside waitUntil backstop.
-    return await waitUntil(anyRowSelected, {
-      timeoutMs: DELAY.MAX_POLLS * DELAY.POLL,
-      observe: [getThreadListRoot()],
-    });
+    // Fast polling wait (keeps the flow synchronous without MutationObserver overhead).
+    for (let i = 0; i < DELAY.MAX_POLLS; i++) {
+      if (anyRowSelected()) return true;
+      await sleep(DELAY.POLL);
+    }
+    return false;
   }
 
   /** Poll fn() until truthy, up to MAX_POLLS times. */
@@ -161,7 +108,15 @@ function initMarkRead() {
 
     let selected = await waitForSelection();
     if (!selected) {
-      log("No selection detected after Select-All click — retrying once.");
+      // Sometimes Gmail enables the toolbar action without updating our selection markers.
+      // Only retry Select-All if the Mark-as-Read action is still not available.
+      const btn = findMarkAsReadButtonVisible();
+      if (btn) {
+        log("Selection markers not detected, but Mark-as-Read is visible — proceeding without retry.");
+        return true;
+      }
+
+      log("No selection detected and Mark-as-Read not visible — retrying Select-All once.");
       safeClick(cb);
       await buffer();
       selected = await waitForSelection();
@@ -177,26 +132,23 @@ function initMarkRead() {
   // NOTE: act="1" in the toolbar (not act="568" which is in the dropdown).
 
   async function markAsRead() {
-    // Enforce sequence: don't look for the button until Gmail shows rows selected.
-    const ok = await waitForSelection();
-    if (!ok) {
-      log("Selection not detected — not searching for Mark-as-Read yet.");
+    // Enforce sequence: don't proceed until selection OR the toolbar action is available.
+    // This avoids slow/false-negative selection detection while still keeping ordering correct.
+    let ready = anyRowSelected() || !!findMarkAsReadButtonVisible();
+    if (!ready) {
+      for (let i = 0; i < DELAY.MAX_POLLS; i++) {
+        if (anyRowSelected() || !!findMarkAsReadButtonVisible()) { ready = true; break; }
+        await sleep(DELAY.POLL);
+      }
+    }
+    if (!ready) {
+      log("Selection not detected and Mark-as-Read not available — skipping click.");
       return false;
     }
 
     // Wait for the button to appear (it only shows after rows are selected)
     const btn = await poll(() => {
-      // Match by data-tooltip (most reliable)
-      const el = document.querySelector('[data-tooltip="Mark as read"]');
-      if (el && el.offsetParent !== null) return el;
-
-      // Fallback: aria-label
-      const el2 = document.querySelector('[aria-label="Mark as read"]');
-      if (el2 && el2.offsetParent !== null) return el2;
-
-      // Fallback: act="1" inside the main toolbar (not in a dropdown)
-      const candidates = [...document.querySelectorAll('div[role="button"][act="1"]')];
-      return candidates.find(e => e.offsetParent !== null) || null;
+      return findMarkAsReadButtonVisible();
     });
 
     if (!btn) {
@@ -253,19 +205,12 @@ function initMarkRead() {
   async function waitForRangeChange(beforeRange) {
     // Primary "page changed" detector: range text changes (e.g., "1–50 of …" → "51–100 of …").
     // This is synchronous in the sense that we only proceed once the condition is met.
-    const pred = () => {
+    for (let i = 0; i < DELAY.MAX_POLLS; i++) {
       const now = getRangeText();
-      return !!(now && now !== beforeRange);
-    };
-
-    const ok = await waitUntil(pred, {
-      timeoutMs: DELAY.MAX_POLLS * DELAY.POLL,
-      observe: [getRangeNode(), getThreadListRoot()],
-    });
-
-    // If the range node was replaced during navigation, re-check once.
-    if (ok) return true;
-    return pred();
+      if (now && now !== beforeRange) return true;
+      await sleep(DELAY.POLL);
+    }
+    return false;
   }
 
   async function waitForPageReady(beforeRange) {
